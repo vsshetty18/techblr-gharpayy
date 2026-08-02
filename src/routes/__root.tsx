@@ -13,13 +13,12 @@ import { SettingsProvider as MYTSettingsProvider } from "@/myt/lib/settings-cont
 import { TourDataProvider as MYTTourDataProvider } from "@/myt/lib/tour-data-context";
 import { OwnerProvider } from "@/owner/owner-context";
 import { OnboardingWalkthrough } from "@/components/OnboardingWalkthrough";
-
+import { useEffect } from "react";
+import { useApp } from "@/lib/store";
 import appCss from "../styles.css?url";
-
 interface RouterContext {
   queryClient: QueryClient;
 }
-
 function NotFoundComponent() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -38,7 +37,6 @@ function NotFoundComponent() {
     </div>
   );
 }
-
 export const Route = createRootRouteWithContext<RouterContext>()({
   head: () => ({
     meta: [
@@ -61,7 +59,6 @@ export const Route = createRootRouteWithContext<RouterContext>()({
   component: RootComponent,
   notFoundComponent: NotFoundComponent,
 });
-
 function RootShell({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
@@ -75,9 +72,14 @@ function RootShell({ children }: { children: React.ReactNode }) {
     </html>
   );
 }
-
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+  const loadFromSupabase = useApp((s) => s.loadFromSupabase);
+
+  useEffect(() => {
+    loadFromSupabase();
+  }, [loadFromSupabase]);
+
   return (
     <QueryClientProvider client={queryClient}>
       <MYTSettingsProvider>
