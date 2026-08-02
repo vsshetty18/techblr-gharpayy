@@ -5,6 +5,7 @@ import type {
   HandoffMessage, ActiveSequence, SequenceKind, Booking,
 } from "./types";
 import { ACTIVITIES, FOLLOWUPS, LEADS, PROPERTIES, TCMS, TOURS, HANDOFFS, SEQUENCES_INIT } from "./mock-data";
+import { fetchLeads, fetchProperties, fetchFollowUps, insertLead, updateLeadRow, insertProperty, updatePropertyRow, insertFollowUp, updateFollowUpRow } from "./db";
 import { autoAssign as autoAssignFn } from "./routing";
 import { pushObjectionToOwner, pushTourViewToOwner } from "@/owner/team-bridge";
 import { emit as emitConnector } from "./connectors";
@@ -31,6 +32,8 @@ interface AppState {
   handoffs: HandoffMessage[];
   sequences: ActiveSequence[];
   bookings: Booking[];
+
+  loadFromSupabase: () => Promise<void>;
 
   setLeadStage: (leadId: string, stage: LeadStage) => void;
   setLeadIntent: (leadId: string, intent: Intent) => void;
@@ -100,12 +103,25 @@ export const useApp = create<AppState>((set, get) => ({
   sequences: SEQUENCES_INIT,
   bookings: [],
 
+  loadFromSupabase: async () => {
+    const [leads, properties, followUps] = await Promise.all([
+      fetchLeads(), fetchProperties(), fetchFollowUps(),
+    ]);
+    set({
+      leads: leads.length ? leads : LEADS,
+      properties: properties.length ? properties : PROPERTIES,
+      followUps: followUps.length ? followUps : FOLLOWUPS,
+    });
+  },
+
   setLeadStage: (leadId, stage) => {
+    const updatedAt = new Date().toISOString();
     set((s) => ({
       leads: s.leads.map((l) =>
-        l.id === leadId ? { ...l, stage, updatedAt: new Date().toISOString() } : l,
+        l.id === leadId ? { ...l, stage, updatedAt } : l,
       ),
     }));
+    updateLeadRow(leadId, { stage, updated_at: updatedAt });
     pushActivity(set, get, {
       kind: "status_changed", actor: get().role, leadId,
       text: `Status changed to ${stage}`,
@@ -173,7 +189,6 @@ export const useApp = create<AppState>((set, get) => ({
       kind: "message_sent", actor: "system", leadId, tourId: tour.id,
       text: `Auto WhatsApp confirmation sent to ${lead.name}`,
     });
-    // Connector — Flow Ops scheduling earns assist; TCM is primary.
     const actorRole = get().role;
     const actorId = actorRole === "tcm" ? get().currentTcmId : actorRole;
     emitConnector({
@@ -224,7 +239,6 @@ export const useApp = create<AppState>((set, get) => ({
       ),
     }));
     pushActivity(set, get, { kind: "tour_completed", actor: t.tcmId, leadId: t.leadId, tourId, text: "Tour marked completed" });
-    // Bridge → owner: every completed tour bumps the room's view counter
     const prop = get().properties.find((p) => p.id === t.propertyId);
     if (prop) pushTourViewToOwner(prop.name);
     const lead = get().leads.find((l) => l.id === t.leadId);
@@ -305,8 +319,6 @@ export const useApp = create<AppState>((set, get) => ({
         set((s) => ({ followUps: [f, ...s.followUps] }));
       }
     }
-    // Bridge → Owner: every NEW objection logged here pushes a demand-signal
-    // record into the Owner store so the owner's bars reflect real team activity.
     if (next.objection && next.objection !== prevObjection) {
       const prop = get().properties.find((p) => p.id === t.propertyId);
       const tcm = get().tcms.find((m) => m.id === t.tcmId);
@@ -340,6 +352,7 @@ export const useApp = create<AppState>((set, get) => ({
       followUps: s.followUps.map((x) => (x.id === followUpId ? { ...x, done: true } : x)),
       leads: s.leads.map((l) => (l.id === f.leadId ? { ...l, nextFollowUpAt: null } : l)),
     }));
+    updateFollowUpRow(followUpId, { done: true });
     pushActivity(set, get, { kind: "follow_up_done", actor: f.tcmId, leadId: f.leadId, tourId: f.tourId, text: `Follow-up done: ${f.reason}` });
   },
 
@@ -356,7 +369,6 @@ export const useApp = create<AppState>((set, get) => ({
       ),
     }));
     pushActivity(set, get, { kind: "status_changed", actor: get().role, leadId, text: `Reassigned to ${tcm?.name ?? tcmId} · ${reason}` });
-    // auto-handoff
     const lead = get().leads.find((l) => l.id === leadId);
     if (lead) {
       get().sendHandoff({
@@ -455,12 +467,15 @@ export const useApp = create<AppState>((set, get) => ({
       ),
     }));
     pushActivity(set, get, { kind: "decision_logged", actor: tcmId, leadId, tourId, propertyId, text: `Deal closed · ₹${amount.toLocaleString("en-IN")}/mo` });
-    // Connector — find which Flop scheduled this lead's tour, give them assist XP.
     const sched = get().activities.find(
       (a) => a.kind === "tour_scheduled" && a.leadId === leadId && a.tourId === tourId,
     );
     const lead = get().leads.find((l) => l.id === leadId);
     const ownerEvt = get().properties.find((p) => p.id === propertyId);
+    updatePropertyRow(propertyId, {
+      vacant_beds: Math.max(0, (ownerEvt?.vacantBeds ?? 1) - 1),
+      days_since_last_booking: 0,
+    });
     emitConnector({
       kind: "booking.closed",
       actorRole: "tcm", actorId: tcmId,
@@ -479,6 +494,7 @@ export const useApp = create<AppState>((set, get) => ({
       ...input,
     };
     set((s) => ({ properties: [prop, ...s.properties] }));
+    insertProperty(prop);
     return prop;
   },
 
@@ -525,6 +541,7 @@ export const useApp = create<AppState>((set, get) => ({
       updatedAt: nowIso,
     };
     set((s) => ({ leads: [lead, ...s.leads] }));
+    insertLead(lead);
     pushActivity(set, get, {
       kind: "lead_created", actor: get().role, leadId: lead.id,
       text: `Lead created · ${lead.name} (${lead.preferredArea})`,
@@ -603,13 +620,10 @@ export function computePropertyMetrics(
 /** Dynamic deal probability score */
 export function recomputeConfidence(lead: Lead, tours: Tour[]): number {
   let score = lead.confidence;
-  // Response speed weight
   if (lead.responseSpeedMins <= 5) score += 5;
   else if (lead.responseSpeedMins > 15) score -= 5;
-  // Tour completed?
   const hasCompleted = tours.some((t) => t.leadId === lead.id && t.status === "completed");
   if (hasCompleted) score += 8;
-  // Move-in urgency
   const days = (new Date(lead.moveInDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24);
   if (days <= 3) score += 6;
   else if (days >= 14) score -= 4;
